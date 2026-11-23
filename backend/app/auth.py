@@ -45,3 +45,14 @@ def require_admin(user: models.User = Depends(get_current_user)) -> models.User:
     if user.role not in ("COMPANY_ADMIN", "SUPER_ADMIN"):
         raise HTTPException(status_code=403, detail="Admin access required")
     return user
+
+def require_super_admin(user: models.User = Depends(get_current_user)) -> models.User:
+    if user.role != "SUPER_ADMIN":
+        raise HTTPException(status_code=403, detail="Platform-owner access required")
+    return user
+
+def log_audit(db: Session, tenant_id: str, user_id: int | None, category: str, message: str, meta: dict | None = None):
+    entry = models.AuditLogEntry(
+        tenant_id=tenant_id, user_id=user_id, category=category, message=message, meta=meta or {},
+    )
+    db.add(entry)

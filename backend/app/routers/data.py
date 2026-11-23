@@ -52,3 +52,20 @@ def patch_data(
     record.updated_at = datetime.utcnow()
     db.commit()
     return {"ok": True}
+
+@router.get("/audit-log")
+def get_audit_log(user: models.User = Depends(auth.get_current_user), db: Session = Depends(get_db)):
+    """Server-recorded audit trail (who changed what, with a timestamp the client can't edit).
+    Platform owner sees every tenant's entries; everyone else sees only their own tenant's."""
+    q = db.query(models.AuditLogEntry)
+    if user.role != "SUPER_ADMIN":
+        q = q.filter(models.AuditLogEntry.tenant_id == user.tenant_id)
+    rows = q.order_by(models.AuditLogEntry.created_at.desc()).limit(500).all()
+    return [
+        {
+            "id": r.id, "tenantId": r.tenant_id, "userId": r.user_id,
+            "category": r.category, "message": r.message, "meta": r.meta,
+            "createdAt": r.created_at.isoformat() if r.created_at else None,
+        }
+        for r in rows
+    ]
