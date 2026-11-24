@@ -1,0 +1,3 @@
+User-agent: *
+Allow: /
+Sitemap: https://jeffworld.dev/sitemap.xml
