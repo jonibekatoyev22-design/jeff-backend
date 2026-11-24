@@ -25,6 +25,7 @@ class User(Base):
     email             = Column(String, unique=True, nullable=False, index=True)
     hashed_password   = Column(String, nullable=False)
     name              = Column(String, nullable=False)
+    phone             = Column(String, nullable=True)
     role              = Column(String, default="USER")        # SUPER_ADMIN | COMPANY_ADMIN | USER
     status            = Column(String, default="PENDING")     # PENDING | APPROVED | REJECTED
     email_verified    = Column(Boolean, default=True)         # no SMTP wired up yet — see note in auth.py

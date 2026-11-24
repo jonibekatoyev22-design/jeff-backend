@@ -228,15 +228,29 @@ async def import_xlsx(file: UploadFile = File(...), user: models.User = Depends(
         raise HTTPException(status_code=400, detail="Could not read this file — is it a valid .xlsx workbook?")
 
     ws = wb.worksheets[0]
-    rows_iter = ws.iter_rows(values_only=True)
-    try:
-        header_row = next(rows_iter)
-    except StopIteration:
-        return {"headers": [], "rows": [], "sheet": ws.title}
+    all_rows = list(ws.iter_rows(values_only=True))
 
+    # Real-world exports (payroll summaries, carrier reports, etc.) almost never
+    # put the header on row 1 — there's usually a title/date preamble first.
+    # Scan the first few rows and treat the first "dense" row (several filled
+    # cells) as the header, instead of blindly trusting row 1.
+    def _nonempty(row):
+        return sum(1 for v in (row or []) if v is not None and str(v).strip() != "")
+
+    header_idx = 0
+    scan_window = min(20, len(all_rows))
+    for i in range(scan_window):
+        if _nonempty(all_rows[i]) >= 3:
+            header_idx = i
+            break
+
+    if not all_rows:
+        return {"headers": [], "rows": [], "sheet": ws.title, "sheets": wb.sheetnames}
+
+    header_row = all_rows[header_idx]
     headers = [str(h).strip() if h is not None else f"col{i+1}" for i, h in enumerate(header_row)]
     out_rows = []
-    for raw in rows_iter:
+    for raw in all_rows[header_idx + 1:]:
         if raw is None or all(v is None or str(v).strip() == "" for v in raw):
             continue
         row = {}
@@ -247,10 +261,46 @@ async def import_xlsx(file: UploadFile = File(...), user: models.User = Depends(
             row[h] = v
         out_rows.append(row)
 
-    return {"headers": headers, "rows": out_rows, "sheet": ws.title}
+    return {
+        "headers": headers,
+        "rows": out_rows,
+        "sheet": ws.title,
+        "sheets": wb.sheetnames,
+        "header_row_index": header_idx,
+    }
 
 
-# ───────────────────────── IMPORT: PDF (best-effort) ─────────────────────────
+# ───────────────────────── IMPORT: PDF (multi-strategy, multi-page) ─────────────────────────
+
+def _norm_header(cells: list) -> list[str]:
+    return [str(h).strip().lower() if h else "" for h in cells]
+
+
+def _clean_row(raw: list, headers: list[str]) -> dict | None:
+    if not raw or all(v is None or str(v).strip() == "" for v in raw):
+        return None
+    return {
+        headers[i] if i < len(headers) else f"col{i+1}": (v.strip() if isinstance(v, str) else v)
+        for i, v in enumerate(raw)
+    }
+
+
+def _extract_tables_for_page(page, strategies: list[dict]) -> list[list[list]]:
+    """Try several pdfplumber table strategies on one page, in order, and
+    return the first one that finds real tables. Carrier/broker statements
+    are inconsistent: some draw ruled grid lines (the default "lines"
+    strategy works), many others are plain whitespace-aligned text with no
+    visible borders at all (only the "text" strategy finds rows there)."""
+    for settings in strategies:
+        try:
+            tables = page.extract_tables(table_settings=settings) if settings else page.extract_tables()
+        except Exception:
+            continue
+        tables = [t for t in (tables or []) if t and len(t) > 1]
+        if tables:
+            return tables
+    return []
+
 
 @router.post("/import/pdf")
 async def import_pdf(file: UploadFile = File(...), user: models.User = Depends(auth.get_current_user)):
@@ -263,36 +313,63 @@ async def import_pdf(file: UploadFile = File(...), user: models.User = Depends(a
     if len(content) > 15 * 1024 * 1024:
         raise HTTPException(status_code=413, detail="File too large (max 15MB).")
 
-    tables_found: list[list[list[Any]]] = []
+    # Three fallback strategies, tried in order per page: default (ruled
+    # lines), then pure text-alignment (no lines at all — the common case
+    # for statements exported as plain reports), then a looser text variant
+    # with smaller tolerances for tightly-spaced columns.
+    strategies = [
+        None,
+        {"vertical_strategy": "text", "horizontal_strategy": "text"},
+        {"vertical_strategy": "text", "horizontal_strategy": "text", "text_x_tolerance": 2, "text_y_tolerance": 2},
+    ]
+
+    pages_tables: list[list[list[list]]] = []  # per-page list of tables
     text_preview_parts: list[str] = []
     try:
         with pdfplumber.open(io.BytesIO(content)) as pdf:
             for page in pdf.pages:
-                for tbl in page.extract_tables() or []:
-                    if tbl and len(tbl) > 1:
-                        tables_found.append(tbl)
+                pages_tables.append(_extract_tables_for_page(page, strategies))
                 text_preview_parts.append(page.extract_text() or "")
     except Exception:
         raise HTTPException(status_code=400, detail="Could not read this file — is it a valid PDF?")
 
-    if not tables_found:
+    all_tables = [t for page_tables in pages_tables for t in page_tables]
+    if not all_tables:
         return {
             "headers": [], "rows": [],
             "rawTextPreview": "\n".join(text_preview_parts)[:4000],
-            "note": "No structured table detected in this PDF. Review the raw text preview and enter data manually, or try a cleaner export from the carrier portal.",
+            "note": "No structured table detected in this PDF, even after trying both ruled-line and text-alignment extraction. Review the raw text preview and enter data manually, or try a cleaner export from the carrier portal.",
         }
 
-    best = max(tables_found, key=len)
-    headers = [str(h).strip() if h else f"col{i+1}" for i, h in enumerate(best[0])]
-    out_rows = []
-    for raw in best[1:]:
-        if not raw or all(v is None or str(v).strip() == "" for v in raw):
-            continue
-        row = {headers[i] if i < len(headers) else f"col{i+1}": (v.strip() if isinstance(v, str) else v) for i, v in enumerate(raw)}
-        out_rows.append(row)
+    # Group tables by matching header row so a statement that spans several
+    # pages (the normal case for a weekly report) gets all its rows merged
+    # into one table, instead of only the single biggest page winning and
+    # the rest being silently dropped.
+    groups: list[dict] = []  # [{headers_norm, headers, rows: [...]}]
+    for tbl in all_tables:
+        raw_headers = tbl[0]
+        headers_norm = _norm_header(raw_headers)
+        group = next((g for g in groups if g["headers_norm"] == headers_norm), None)
+        if group is None:
+            headers = [str(h).strip() if h else f"col{i+1}" for i, h in enumerate(raw_headers)]
+            group = {"headers_norm": headers_norm, "headers": headers, "rows_raw": []}
+            groups.append(group)
+        for raw in tbl[1:]:
+            # Skip a repeated header row (common when a table restarts on
+            # each new page with the same column titles).
+            if _norm_header(raw) == headers_norm:
+                continue
+            group["rows_raw"].append(raw)
+
+    best_group = max(groups, key=lambda g: len(g["rows_raw"]))
+    out_rows = [r for r in (_clean_row(raw, best_group["headers"]) for raw in best_group["rows_raw"]) if r]
+
+    extra_note = ""
+    if len(groups) > 1:
+        extra_note = f" {len(groups)-1} other, differently-shaped table(s) on this PDF were ignored — if this looks wrong, the statement may mix formats mid-document."
 
     return {
-        "headers": headers, "rows": out_rows,
+        "headers": best_group["headers"], "rows": out_rows,
         "rawTextPreview": "\n".join(text_preview_parts)[:4000],
-        "note": f"Best-effort extraction found {len(tables_found)} table(s) on this PDF — showing the largest one. Please review before saving.",
+        "note": f"Extracted {len(out_rows)} row(s) across {sum(1 for pt in pages_tables if pt)} page(s) with matching columns.{extra_note} Please review before saving.",
     }
