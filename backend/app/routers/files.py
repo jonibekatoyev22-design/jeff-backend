@@ -320,6 +320,8 @@ async def import_xlsx(file: UploadFile = File(...), user: models.User = Depends(
         wb = load_workbook(io.BytesIO(content), read_only=True, data_only=True)
     except Exception:
         raise HTTPException(status_code=400, detail="Could not read this file — is it a valid .xlsx workbook?")
+    finally:
+        del content  # workbook is already loaded into its own read-only structures; no need to hold the raw bytes too
 
     ws = wb.worksheets[0]
     all_rows = list(ws.iter_rows(values_only=True))
@@ -424,8 +426,20 @@ async def import_pdf(file: UploadFile = File(...), user: models.User = Depends(a
             for page in pdf.pages:
                 pages_tables.append(_extract_tables_for_page(page, strategies))
                 text_preview_parts.append(page.extract_text() or "")
+                # pdfplumber caches every parsed char/word/rect object per page for
+                # the life of the `with` block. Running 3 extraction strategies on a
+                # multi-page statement without releasing that cache is what pushed
+                # this service past Render's memory limit and triggered an OOM
+                # restart — flush it as soon as we're done with each page so peak
+                # memory stays roughly flat regardless of page count.
+                try:
+                    page.flush_cache()
+                except Exception:
+                    pass
     except Exception:
         raise HTTPException(status_code=400, detail="Could not read this file — is it a valid PDF?")
+    finally:
+        del content
 
     all_tables = [t for page_tables in pages_tables for t in page_tables]
     if not all_tables:
