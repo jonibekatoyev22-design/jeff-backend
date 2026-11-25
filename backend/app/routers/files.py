@@ -47,6 +47,25 @@ def _safe_filename(title: str) -> str:
     return keep[:80]
 
 
+def _is_summable(col_type: ColType) -> bool:
+    return col_type in ("number", "money")
+
+
+def _column_total(rows: list[dict], col: "ExportColumn"):
+    total = 0.0
+    seen = False
+    for row in rows:
+        v = row.get(col.key)
+        if v is None or v == "":
+            continue
+        try:
+            total += float(v)
+            seen = True
+        except (TypeError, ValueError):
+            return None
+    return total if seen else None
+
+
 def _fmt_text(value: Any, col_type: ColType) -> str:
     """Single source of truth for how a cell *looks* — used by the PDF path so
     PDF and Excel exports of the same data always agree on formatting."""
@@ -77,7 +96,7 @@ def _fmt_text(value: Any, col_type: ColType) -> str:
 # ───────────────────────── EXPORT: XLSX ─────────────────────────
 
 @router.post("/export/xlsx")
-def export_xlsx(req: ExportRequest, user: models.User = Depends(auth.get_current_user)):
+def export_xlsx(req: ExportRequest, db: Session = Depends(get_db), user: models.User = Depends(auth.get_current_user)):
     try:
         from openpyxl import Workbook
         from openpyxl.styles import Font, PatternFill, Alignment
@@ -85,15 +104,29 @@ def export_xlsx(req: ExportRequest, user: models.User = Depends(auth.get_current
     except ImportError:
         raise HTTPException(status_code=501, detail="Excel export is not available on the server yet.")
 
+    tenant = db.query(models.Tenant).filter(models.Tenant.id == user.tenant_id).first()
+    company = tenant.name if tenant else ""
+    n_cols = len(req.columns)
+
     wb = Workbook()
     ws = wb.active
     ws.title = _safe_filename(req.title)[:31] or "Sheet1"
 
     header_fill = PatternFill(start_color="1F2937", end_color="1F2937", fill_type="solid")
     header_font = Font(color="FFFFFF", bold=True)
+    title_font = Font(bold=True, size=14)
+    sub_font = Font(color="6B7280", size=9)
+    total_fill = PatternFill(start_color="F3F4F6", end_color="F3F4F6", fill_type="solid")
+    total_font = Font(bold=True)
+
+    # Row 1: company name · Row 2: report title · Row 3: generated/row-count caption
+    ws.cell(row=1, column=1, value=company or "Jeff Accountant").font = title_font
+    ws.cell(row=2, column=1, value=req.title).font = Font(bold=True, size=11)
+    ws.cell(row=3, column=1, value=f"Generated {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')} · {len(req.rows)} row{'s' if len(req.rows)!=1 else ''}").font = sub_font
+    HEADER_ROW = 5
 
     for ci, col in enumerate(req.columns, start=1):
-        c = ws.cell(row=1, column=ci, value=col.label)
+        c = ws.cell(row=HEADER_ROW, column=ci, value=col.label)
         c.font = header_font
         c.fill = header_fill
         c.alignment = Alignment(vertical="center")
@@ -103,7 +136,7 @@ def export_xlsx(req: ExportRequest, user: models.User = Depends(auth.get_current
     percent_fmt = '0.##"%"'
     date_fmt = "yyyy-mm-dd"
 
-    for ri, row in enumerate(req.rows, start=2):
+    for ri, row in enumerate(req.rows, start=HEADER_ROW + 1):
         for ci, col in enumerate(req.columns, start=1):
             val = row.get(col.key)
             cell = ws.cell(row=ri, column=ci)
@@ -133,12 +166,30 @@ def export_xlsx(req: ExportRequest, user: models.User = Depends(auth.get_current
             else:
                 cell.value = str(val)
 
+    # Totals row — only when at least one summable (number/money) column exists,
+    # so every export agrees on a bottom-line sum the same way the PDF does.
+    if req.rows and any(_is_summable(c.type) for c in req.columns):
+        total_row = HEADER_ROW + len(req.rows) + 1
+        wrote_label = False
+        for ci, col in enumerate(req.columns, start=1):
+            cell = ws.cell(row=total_row, column=ci)
+            cell.fill = total_fill
+            cell.font = total_font
+            if _is_summable(col.type):
+                total = _column_total(req.rows, col)
+                if total is not None:
+                    cell.value = total
+                    cell.number_format = money_fmt if col.type == "money" else number_fmt
+            elif not wrote_label:
+                cell.value = "TOTAL"
+                wrote_label = True
+
     for ci, col in enumerate(req.columns, start=1):
         width = max(10, min(40, len(col.label) + 4))
         ws.column_dimensions[get_column_letter(ci)].width = width
-    ws.freeze_panes = "A2"
+    ws.freeze_panes = f"A{HEADER_ROW + 1}"
     if req.rows:
-        ws.auto_filter.ref = f"A1:{get_column_letter(len(req.columns))}{len(req.rows) + 1}"
+        ws.auto_filter.ref = f"A{HEADER_ROW}:{get_column_letter(n_cols)}{HEADER_ROW + len(req.rows)}"
 
     buf = io.BytesIO()
     wb.save(buf)
@@ -154,36 +205,61 @@ def export_xlsx(req: ExportRequest, user: models.User = Depends(auth.get_current
 # ───────────────────────── EXPORT: PDF ─────────────────────────
 
 @router.post("/export/pdf")
-def export_pdf(req: ExportRequest, user: models.User = Depends(auth.get_current_user)):
+def export_pdf(req: ExportRequest, db: Session = Depends(get_db), user: models.User = Depends(auth.get_current_user)):
     try:
         from reportlab.lib import colors
         from reportlab.lib.pagesizes import letter, landscape
-        from reportlab.lib.styles import getSampleStyleSheet
+        from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
         from reportlab.lib.units import inch
+        from reportlab.lib.enums import TA_RIGHT
         from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
     except ImportError:
         raise HTTPException(status_code=501, detail="PDF export is not available on the server yet.")
+
+    tenant = db.query(models.Tenant).filter(models.Tenant.id == user.tenant_id).first()
+    company = tenant.name if tenant else "Jeff Accountant"
 
     buf = io.BytesIO()
     page_size = landscape(letter) if len(req.columns) > 5 else letter
     doc = SimpleDocTemplate(
         buf, pagesize=page_size,
-        leftMargin=0.4 * inch, rightMargin=0.4 * inch, topMargin=0.5 * inch, bottomMargin=0.4 * inch,
+        leftMargin=0.4 * inch, rightMargin=0.4 * inch, topMargin=0.5 * inch, bottomMargin=0.5 * inch,
     )
     styles = getSampleStyleSheet()
     cell_style = styles["BodyText"]
     cell_style.fontSize = 7.5
     cell_style.leading = 9
+    company_style = ParagraphStyle("company", parent=styles["Normal"], fontSize=10, textColor=colors.HexColor("#6B7280"))
 
     header = [col.label for col in req.columns]
     data_rows = [header]
     for row in req.rows:
         data_rows.append([_fmt_text(row.get(col.key), col.type) for col in req.columns])
 
+    has_totals = req.rows and any(_is_summable(c.type) for c in req.columns)
+    if has_totals:
+        total_row_vals = []
+        wrote_label = False
+        for col in req.columns:
+            total = _column_total(req.rows, col) if _is_summable(col.type) else None
+            if total is not None:
+                total_row_vals.append(_fmt_text(total, col.type))
+            elif not wrote_label:
+                total_row_vals.append("TOTAL")
+                wrote_label = True
+            else:
+                total_row_vals.append("")
+        data_rows.append(total_row_vals)
+
+    # Weight column widths by label length instead of splitting the page evenly,
+    # so a long "Description" column isn't squeezed as tight as "Unit #".
     avail_width = page_size[0] - 0.8 * inch
-    col_width = avail_width / max(1, len(req.columns))
-    table = Table(data_rows, colWidths=[col_width] * len(req.columns), repeatRows=1)
-    table.setStyle(TableStyle([
+    weights = [max(6, len(col.label)) for col in req.columns]
+    total_weight = sum(weights)
+    col_widths = [avail_width * (w / total_weight) for w in weights]
+
+    table = Table(data_rows, colWidths=col_widths, repeatRows=1)
+    style_cmds = [
         ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#1F2937")),
         ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
         ("FONTSIZE", (0, 0), (-1, 0), 8),
@@ -193,15 +269,33 @@ def export_pdf(req: ExportRequest, user: models.User = Depends(auth.get_current_
         ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
         ("TOPPADDING", (0, 0), (-1, -1), 3),
         ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
-    ]))
+    ]
+    if has_totals:
+        last = len(data_rows) - 1
+        style_cmds += [
+            ("BACKGROUND", (0, last), (-1, last), colors.HexColor("#E5E7EB")),
+            ("FONTNAME", (0, last), (-1, last), "Helvetica-Bold"),
+            ("LINEABOVE", (0, last), (-1, last), 1, colors.HexColor("#1F2937")),
+        ]
+    table.setStyle(TableStyle(style_cmds))
 
     elements = [
+        Paragraph(company, company_style),
         Paragraph(f"<b>{req.title}</b>", styles["Title"]),
-        Paragraph(f"Generated {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')} · {len(req.rows)} rows", styles["Normal"]),
+        Paragraph(f"Generated {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')} · {len(req.rows)} row{'s' if len(req.rows)!=1 else ''}", styles["Normal"]),
         Spacer(1, 12),
         table,
     ]
-    doc.build(elements)
+
+    def _add_page_number(canvas, doc_):
+        canvas.saveState()
+        canvas.setFont("Helvetica", 8)
+        canvas.setFillColor(colors.HexColor("#6B7280"))
+        canvas.drawRightString(page_size[0] - 0.4 * inch, 0.3 * inch, f"Page {doc_.page}")
+        canvas.drawString(0.4 * inch, 0.3 * inch, company)
+        canvas.restoreState()
+
+    doc.build(elements, onFirstPage=_add_page_number, onLaterPages=_add_page_number)
     buf.seek(0)
     filename = f"{_safe_filename(req.title)}.pdf"
     return StreamingResponse(

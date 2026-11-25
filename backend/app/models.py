@@ -13,6 +13,7 @@ class Tenant(Base):
     currency      = Column(String, default="USD")
     business_type = Column(String, default="Trucking Carrier")
     is_platform   = Column(Boolean, default=False)   # true only for the platform-owner's own tenant
+    is_active     = Column(Boolean, default=True)    # suspended companies cannot log in, but their data is kept
     plan          = Column(String, default="basic")
     created_at    = Column(DateTime, default=datetime.utcnow)
     users         = relationship("User", back_populates="tenant")

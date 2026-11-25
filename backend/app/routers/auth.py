@@ -110,13 +110,16 @@ def login(req: LoginRequest, db: Session = Depends(get_db)):
     if user.status == "REJECTED":
         raise HTTPException(status_code=403, detail="Your registration was rejected. Contact the platform owner.")
     if not user.is_active:
-        raise HTTPException(status_code=403, detail="Account is disabled")
+        raise HTTPException(status_code=403, detail="This account has been suspended. Contact your company admin.")
+
+    tenant = db.query(models.Tenant).filter(models.Tenant.id == user.tenant_id).first()
+    if tenant and not tenant.is_active:
+        raise HTTPException(status_code=403, detail="This company's account has been suspended. Contact the platform owner.")
 
     auth.log_audit(db, user.tenant_id, user.id, "AUTH", "User logged in", {"email": email})
     db.commit()
 
     token = auth.create_access_token({"sub": str(user.id)})
-    tenant = db.query(models.Tenant).filter(models.Tenant.id == user.tenant_id).first()
     return TokenResponse(access_token=token, user=_user_dict(user), tenant=_tenant_dict(tenant))
 
 # Kept for API-doc compatibility / Swagger's "Authorize" button (OAuth2 form login).
@@ -249,6 +252,38 @@ def update_user_info(user_id: int, req: UserInfoUpdateRequest, db: Session = Dep
     db.refresh(user)
     return _user_dict(user)
 
+@router.post("/user/{user_id}/suspend")
+def suspend_user(user_id: int, db: Session = Depends(get_db), admin: models.User = Depends(auth.require_admin)):
+    """Disable a user's login without deleting their account or history.
+    Same scoping as role changes: SUPER_ADMIN can act on anyone; COMPANY_ADMIN only within their own tenant."""
+    user = db.query(models.User).filter(models.User.id == user_id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    if user.role == "SUPER_ADMIN":
+        raise HTTPException(status_code=400, detail="Cannot suspend the platform owner")
+    if admin.role != "SUPER_ADMIN" and user.tenant_id != admin.tenant_id:
+        raise HTTPException(status_code=403, detail="You can only manage users in your own company")
+    if user.id == admin.id:
+        raise HTTPException(status_code=400, detail="You cannot suspend your own account")
+    user.is_active = False
+    auth.log_audit(db, user.tenant_id, admin.id, "SYSTEM", "User suspended", {"email": user.email})
+    db.commit()
+    db.refresh(user)
+    return _user_dict(user)
+
+@router.post("/user/{user_id}/activate")
+def activate_user(user_id: int, db: Session = Depends(get_db), admin: models.User = Depends(auth.require_admin)):
+    user = db.query(models.User).filter(models.User.id == user_id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    if admin.role != "SUPER_ADMIN" and user.tenant_id != admin.tenant_id:
+        raise HTTPException(status_code=403, detail="You can only manage users in your own company")
+    user.is_active = True
+    auth.log_audit(db, user.tenant_id, admin.id, "SYSTEM", "User reactivated", {"email": user.email})
+    db.commit()
+    db.refresh(user)
+    return _user_dict(user)
+
 @router.get("/team")
 def list_team(db: Session = Depends(get_db), admin: models.User = Depends(auth.require_admin)):
     """List everyone in the current admin's own tenant."""
@@ -324,6 +359,30 @@ def list_all_tenants(db: Session = Depends(get_db), _: models.User = Depends(aut
         })
     return out
 
+@router.post("/tenant/{tenant_id}/suspend")
+def suspend_tenant(tenant_id: str, db: Session = Depends(get_db), admin: models.User = Depends(auth.require_super_admin)):
+    """Deactivate a company: its users can no longer log in, but all data is kept untouched.
+    Reversible via /activate — unlike DELETE, which destroys everything."""
+    tenant = db.query(models.Tenant).filter(models.Tenant.id == tenant_id).first()
+    if not tenant:
+        raise HTTPException(status_code=404, detail="Tenant not found")
+    if tenant.is_platform:
+        raise HTTPException(status_code=400, detail="Cannot suspend the platform tenant")
+    tenant.is_active = False
+    auth.log_audit(db, admin.tenant_id, admin.id, "PLATFORM", f"Tenant suspended: {tenant.name}", {"tenantId": tenant_id})
+    db.commit()
+    return {"ok": True}
+
+@router.post("/tenant/{tenant_id}/activate")
+def activate_tenant(tenant_id: str, db: Session = Depends(get_db), admin: models.User = Depends(auth.require_super_admin)):
+    tenant = db.query(models.Tenant).filter(models.Tenant.id == tenant_id).first()
+    if not tenant:
+        raise HTTPException(status_code=404, detail="Tenant not found")
+    tenant.is_active = True
+    auth.log_audit(db, admin.tenant_id, admin.id, "PLATFORM", f"Tenant reactivated: {tenant.name}", {"tenantId": tenant_id})
+    db.commit()
+    return {"ok": True}
+
 @router.delete("/tenant/{tenant_id}")
 def delete_tenant(tenant_id: str, db: Session = Depends(get_db), admin: models.User = Depends(auth.require_super_admin)):
     """Delete a tenant and everything in it (users, data). Cannot delete the platform's own tenant."""
@@ -349,6 +408,7 @@ def _user_dict(user: models.User) -> dict:
         "phone": user.phone,
         "role": user.role,
         "status": user.status,
+        "isActive": user.is_active,
         "tenantId": user.tenant_id,
         "createdAt": user.created_at.isoformat() if user.created_at else None,
     }
@@ -365,5 +425,6 @@ def _tenant_dict(tenant: models.Tenant) -> dict:
         "currency": tenant.currency,
         "businessType": tenant.business_type,
         "isPlatform": tenant.is_platform,
+        "isActive": tenant.is_active,
         "createdAt": tenant.created_at.isoformat() if tenant.created_at else None,
     }

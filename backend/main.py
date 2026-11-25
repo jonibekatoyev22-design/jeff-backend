@@ -14,6 +14,7 @@ def _migrate():
     try:
         with engine.begin() as conn:
             conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS phone VARCHAR"))
+            conn.execute(text("ALTER TABLE tenants ADD COLUMN IF NOT EXISTS is_active BOOLEAN DEFAULT TRUE"))
     except Exception:
         pass  # e.g. local sqlite dev DB, which doesn't support IF NOT EXISTS here — harmless
 
