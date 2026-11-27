@@ -3,7 +3,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import text
 from app.config import settings
 from app.database import engine, Base
-from app.routers import auth, data, files, ai
+from app import models_policy  # noqa: F401 — registers the Policy-schema tables with Base.metadata
+from app.routers import auth, data, files, ai, policy
 
 Base.metadata.create_all(bind=engine)
 
@@ -34,6 +35,7 @@ app.include_router(auth.router)
 app.include_router(data.router)
 app.include_router(files.router)
 app.include_router(ai.router)
+app.include_router(policy.router)
 
 @app.get("/")
 def health():
